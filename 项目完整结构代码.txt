@@ -1,0 +1,472 @@
+项目 'godmode-2api' 的结构树:
+📂 godmode-2api/
+    📄 .env
+    📄 .env.example
+    📄 .gitignore
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 godmode_provider.py
+        📂 utils/
+            📄 sse_utils.py
+================================================================================
+
+--- 文件路径: .env ---
+
+# ====================================================================
+# godmode-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。强烈建议修改为一个复杂的、您自己的密钥。
+API_MASTER_KEY=1
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# godmode-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。强烈建议修改为一个复杂的、您自己的密钥。
+API_MASTER_KEY=godmode-2api-default-key
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: .gitignore ---
+
+.env
+
+--- 文件路径: Dockerfile ---
+
+# ====================================================================
+# Dockerfile for godmode-2api
+# ====================================================================
+
+FROM python:3.10-slim
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# 安装系统依赖 (cloudscraper 可能需要)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建并切换到非 root 用户
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# 暴露端口并启动
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: godmode-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - godmode-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: godmode-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - godmode-net
+
+networks:
+  godmode-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+import logging
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from app.core.config import settings
+from app.providers.godmode_provider import GodmodeProvider
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+provider = GodmodeProvider()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    logger.info("服务已进入 'Cloudscraper' 模式，将自动处理 Cloudflare 挑战。")
+    logger.info(f"服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    yield
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "godmode-2api-default-key":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request) -> StreamingResponse:
+    try:
+        request_data = await request.json()
+        return await provider.chat_completion(request_data)
+    except Exception as e:
+        logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+async def list_models():
+    return await provider.get_models()
+
+@app.get("/", summary="根路径")
+def root():
+    return {"message": f"欢迎来到 {settings.APP_NAME} v{settings.APP_VERSION}. 服务运行正常。"}
+
+
+--- 文件路径: nginx.conf ---
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream godmode_backend {
+        # ip_hash 确保来自同一客户端的请求被转发到同一个 worker
+        ip_hash;
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://godmode_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # 流式传输优化
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn[standard]
+httpx
+pydantic-settings
+python-dotenv
+cloudscraper
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Optional
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "godmode-2api"
+    APP_VERSION: str = "1.0.0"
+    DESCRIPTION: str = "一个将 godmode.space 匿名聊天功能转换为兼容 OpenAI 格式 API 的高性能代理。"
+
+    API_MASTER_KEY: Optional[str] = "godmode-2api-default-key"
+    
+    API_REQUEST_TIMEOUT: int = 180
+    NGINX_PORT: int = 8088
+
+    DEFAULT_MODEL: str = "godmode-default-model"
+    KNOWN_MODELS: List[str] = ["godmode-default-model"]
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Union
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(
+        self,
+        request_data: Dict[str, Any]
+    ) -> Union[StreamingResponse, JSONResponse]:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\providers\godmode_provider.py ---
+
+import json
+import time
+import logging
+import uuid
+import cloudscraper
+from typing import Dict, Any, AsyncGenerator
+
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+
+from app.core.config import settings
+from app.providers.base_provider import BaseProvider
+from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
+
+logger = logging.getLogger(__name__)
+
+# v3.0: 服务器端会话缓存
+SESSION_CACHE: Dict[str, str] = {}
+
+class GodmodeProvider(BaseProvider):
+    def __init__(self):
+        self.scraper = cloudscraper.create_scraper()
+        self.base_url = "https://next-api.godmode.space"
+        self.threads_url = f"{self.base_url}/threads"
+
+    async def chat_completion(self, request_data: Dict[str, Any]) -> StreamingResponse:
+        
+        async def stream_generator() -> AsyncGenerator[bytes, None]:
+            request_id = f"chatcmpl-{uuid.uuid4()}"
+            try:
+                messages = request_data.get("messages", [])
+                user_prompt = messages[-1].get("content") if messages else "Hello"
+                
+                # v3.0: 使用 'user' 字段作为会话标识符
+                session_key = request_data.get("user")
+                thread_id = None
+
+                if session_key:
+                    thread_id = SESSION_CACHE.get(session_key)
+                else:
+                    logger.warning("请求中未找到 'user' 字段，将创建新会话。要启用上下文功能，请在请求体中提供一个唯一的 'user' 字符串。")
+
+                is_new_thread = not thread_id
+                stream_url = ""
+                payload = {}
+
+                if is_new_thread:
+                    # 新会话：创建 thread，然后用空JSON触发流
+                    new_thread_id = self._create_thread(user_prompt)
+                    if session_key:
+                        SESSION_CACHE[session_key] = new_thread_id
+                        logger.info(f"为用户 '{session_key}' 创建新会话，thread_id: {new_thread_id}")
+                    stream_url = f"{self.threads_url}/{new_thread_id}"
+                    payload = {} # 第一次触发流用空 body
+                else:
+                    # 延续会话：使用已有的 thread_id 和新消息
+                    logger.info(f"为用户 '{session_key}' 延续会话，thread_id: {thread_id}")
+                    stream_url = f"{self.threads_url}/{thread_id}"
+                    payload = {
+                        "message": {
+                            "id": str(uuid.uuid4()),
+                            "role": "user",
+                            "parts": [{"type": "text", "text": user_prompt}]
+                        }
+                    }
+
+                # 统一的流式请求逻辑
+                response = self.scraper.post(
+                    stream_url, 
+                    headers=self._prepare_headers(), 
+                    json=payload, 
+                    stream=True, 
+                    timeout=settings.API_REQUEST_TIMEOUT
+                )
+                response.raise_for_status()
+
+                # v3.0: 移除所有非标准SSE事件，只发送兼容的 chunk
+                for line in response.iter_lines():
+                    if line.startswith(b"data:"):
+                        content = line[len(b"data:"):].strip()
+                        if not content:
+                            continue
+                        try:
+                            data = json.loads(content)
+                            if data.get("type") == "text":
+                                delta_content = data.get("text")
+                                if delta_content:
+                                    chunk = create_chat_completion_chunk(request_id, settings.DEFAULT_MODEL, delta_content)
+                                    yield create_sse_data(chunk)
+                        except json.JSONDecodeError:
+                            logger.warning(f"无法解析 SSE 数据块: {content}")
+                            continue
+                
+                final_chunk = create_chat_completion_chunk(request_id, settings.DEFAULT_MODEL, "", "stop")
+                yield create_sse_data(final_chunk)
+                yield DONE_CHUNK
+
+            except Exception as e:
+                logger.error(f"处理流时发生错误: {e}", exc_info=True)
+                error_message = f"内部错误: {str(e)}"
+                error_chunk = create_chat_completion_chunk(request_id, settings.DEFAULT_MODEL, error_message, "stop")
+                yield create_sse_data(error_chunk)
+                yield DONE_CHUNK
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    def _create_thread(self, prompt: str) -> str:
+        headers = self._prepare_headers()
+        # 注意：创建线程的请求体是一个包含单个消息的数组
+        payload = [{"text": prompt, "type": "text"}]
+        try:
+            response = self.scraper.post(self.threads_url, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            thread_id = data.get("id")
+            if not thread_id:
+                raise ValueError("'/threads' 响应中缺少 'id' 字段。")
+            return thread_id
+        except Exception as e:
+            logger.error(f"创建新会话失败: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"无法创建新的上游聊天会话: {e}")
+
+    def _prepare_headers(self) -> Dict[str, str]:
+        return {
+            "accept": "*/*",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "content-type": "application/json",
+            "origin": "https://godmode.space",
+            "referer": "https://godmode.space/",
+            "sec-ch-ua": '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+        }
+
+    async def get_models(self) -> JSONResponse:
+        model_data = {
+            "object": "list",
+            "data": [
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
+                for name in settings.KNOWN_MODELS
+            ]
+        }
+        return JSONResponse(content=model_data)
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+DONE_CHUNK = b"data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(data)}\n\n".encode('utf-8')
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+
+
